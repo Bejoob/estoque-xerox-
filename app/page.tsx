@@ -169,7 +169,19 @@ function unidadeLabelFor(unidade: Unidade | "todas") {
   return unidade === "todas" ? "Todas as unidades" : `Unidade ${unidade}`;
 }
 
-const XLSX_COLORS = { ink: "FF18191C", red: "FFD71920", green: "FF16875A", yellow: "FFA96A05", danger: "FFC92B33", greenBg: "FFEAF7F1", yellowBg: "FFFFF7DF", dangerBg: "FFFFEDEF", muted: "FF888888", warnBg: "FFFFF3CD" } as const;
+// Cada status tem dois tons: `Solid` preenche a célula do status (texto branco
+// por cima) e `Row` faixeia a linha inteira — forte o bastante para saltar aos
+// olhos, claro o bastante para não apagar o texto das demais colunas.
+const XLSX_COLORS = {
+  ink: "FF18191C", red: "FFD71920", muted: "FF888888", white: "FFFFFFFF",
+  green: "FF0F7A50", greenSolid: "FF12805A", greenRow: "FFBFE5D2",
+  yellow: "FF9A6004", yellowSolid: "FFB8730A", yellowRow: "FFFBDF9B",
+  danger: "FFB81C27", dangerSolid: "FFC0212C", dangerRow: "FFF7C0C6",
+  warnBg: "FFFFE7A0",
+} as const;
+
+const solidFill = (argb: string) => ({ type: "pattern", pattern: "solid", fgColor: { argb } }) as const;
+const statusFont = { bold: true, color: { argb: XLSX_COLORS.white } } as const;
 
 async function exportStockExcel(products: Product[], movements: Movement[], escopoLabel: string) {
   const ExcelJS = (await import("exceljs")).default;
@@ -226,12 +238,15 @@ async function exportStockExcel(products: Product[], movements: Movement[], esco
   });
   attention.forEach((p, i) => {
     const row = dash.getRow(9 + i);
+    const sem = stockStatus(p) === "sem";
     row.getCell(1).value = p.nome_produto;
     row.getCell(2).value = p.referencia_produto;
     row.getCell(3).value = p.unidade;
     row.getCell(4).value = p.quantidade_atual;
     row.getCell(5).value = p.estoque_minimo;
-    row.getCell(4).fill = { type: "pattern", pattern: "solid", fgColor: { argb: stockStatus(p) === "sem" ? XLSX_COLORS.dangerBg : XLSX_COLORS.yellowBg } };
+    for (let col = 1; col <= 5; col += 1) row.getCell(col).fill = solidFill(sem ? XLSX_COLORS.dangerRow : XLSX_COLORS.yellowRow);
+    row.getCell(4).fill = solidFill(sem ? XLSX_COLORS.dangerSolid : XLSX_COLORS.yellowSolid);
+    row.getCell(4).font = statusFont;
   });
   if (!attention.length) dash.getCell("A9").value = "Nenhum item com estoque baixo ou zerado.";
 
@@ -253,7 +268,14 @@ async function exportStockExcel(products: Product[], movements: Movement[], esco
   products.forEach((p) => {
     const status = stockStatus(p);
     const row = stockSheet.addRow({ ref: p.referencia_produto, nome: p.nome_produto, desc: p.descricao, unidade: p.unidade, qtd: p.quantidade_atual, min: p.estoque_minimo, status: stockStatusLabel(status), upd: dateLabel(p.updated_at) });
-    row.getCell(7).fill = { type: "pattern", pattern: "solid", fgColor: { argb: status === "sem" ? XLSX_COLORS.dangerBg : status === "baixo" ? XLSX_COLORS.yellowBg : XLSX_COLORS.greenBg } };
+    // Só os itens que exigem ação recebem faixa na linha: pintar também os
+    // normais deixaria a planilha inteira colorida e sem hierarquia.
+    if (status !== "normal") {
+      const faixa = solidFill(status === "sem" ? XLSX_COLORS.dangerRow : XLSX_COLORS.yellowRow);
+      for (let col = 1; col <= 8; col += 1) row.getCell(col).fill = faixa;
+    }
+    row.getCell(7).fill = solidFill(status === "sem" ? XLSX_COLORS.dangerSolid : status === "baixo" ? XLSX_COLORS.yellowSolid : XLSX_COLORS.greenSolid);
+    row.getCell(7).font = statusFont;
   });
 
   const movSheet = workbook.addWorksheet("Movimentações");
@@ -273,7 +295,8 @@ async function exportStockExcel(products: Product[], movements: Movement[], esco
   movSheet.views = [{ state: "frozen", ySplit: 1 }];
   movements.forEach((m) => {
     const row = movSheet.addRow({ data: dateLabel(m.data_movimentacao), user: m.usuario_nome, produto: m.produto_nome, ref: m.produto_referencia, unidade: m.unidade, tipo: m.tipo_movimentacao === "entrada" ? "Entrada" : "Retirada", qtd: m.quantidade, obs: m.observacao || "—" });
-    row.getCell(6).fill = { type: "pattern", pattern: "solid", fgColor: { argb: m.tipo_movimentacao === "entrada" ? XLSX_COLORS.greenBg : XLSX_COLORS.dangerBg } };
+    row.getCell(6).fill = solidFill(m.tipo_movimentacao === "entrada" ? XLSX_COLORS.greenSolid : XLSX_COLORS.dangerSolid);
+    row.getCell(6).font = statusFont;
   });
 
   const buffer = await workbook.xlsx.writeBuffer();
@@ -326,7 +349,7 @@ async function exportChecklistExcel(products: Product[], escopoLabel: string) {
     row.getCell(3).value = p.unidade;
     row.getCell(4).value = p.quantidade_atual;
     row.getCell(5).value = null;
-    row.getCell(5).fill = { type: "pattern", pattern: "solid", fgColor: { argb: XLSX_COLORS.warnBg } };
+    row.getCell(5).fill = solidFill(XLSX_COLORS.warnBg);
     row.getCell(6).value = { formula: `IF(E${rowNum}="","",E${rowNum}-D${rowNum})` } as unknown as string;
     row.getCell(7).value = "";
   });
