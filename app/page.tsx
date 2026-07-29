@@ -555,35 +555,70 @@ export default function Home() {
   }
 
   async function saveProduct(product: Product) {
+    let mensagem = "Produto salvo com sucesso.";
     if (supabase) {
       const produtoPayload = { referencia_produto: product.referencia_produto, nome_produto: product.nome_produto, descricao: product.descricao };
       if (editProduct === "new") {
-        const upserted = await supabase.from("produtos").upsert(produtoPayload, { onConflict: "referencia_produto" }).select("id").single();
-        if (upserted.error || !upserted.data) { setToast("Não foi possível salvar o produto."); return; }
-        const estoqueResult = await supabase.from("estoque").upsert({ produto_id: upserted.data.id, unidade: product.unidade, quantidade_atual: product.quantidade_atual, estoque_minimo: product.estoque_minimo }, { onConflict: "produto_id,unidade" });
+        // A referência é única no catálogo inteiro. Se ela já existe, o item é o
+        // mesmo produto em outra unidade: reaproveitamos o cadastro sem tocar no
+        // nome/descrição que as demais unidades já usam. Recusamos quando a
+        // referência já está nesta mesma unidade — seria sobrescrever o produto.
+        const existente = await supabase.from("produtos").select("id,nome_produto").eq("referencia_produto", product.referencia_produto).maybeSingle();
+        if (existente.error) { setToast("Não foi possível verificar a referência."); return; }
+        let produtoId = existente.data?.id as string | undefined;
+        if (produtoId) {
+          const naUnidade = await supabase.from("estoque").select("id").eq("produto_id", produtoId).eq("unidade", product.unidade).maybeSingle();
+          if (naUnidade.error) { setToast("Não foi possível verificar o estoque."); return; }
+          if (naUnidade.data) { setToast(`A referência ${product.referencia_produto} já é do produto “${existente.data?.nome_produto}” na unidade ${product.unidade}. Edite o produto existente.`); return; }
+          mensagem = `Estoque criado na unidade ${product.unidade} para o produto “${existente.data?.nome_produto}”, já cadastrado com esta referência.`;
+        } else {
+          const criado = await supabase.from("produtos").insert(produtoPayload).select("id").single();
+          if (criado.error || !criado.data) { setToast("Não foi possível salvar o produto."); return; }
+          produtoId = criado.data.id;
+        }
+        const estoqueResult = await supabase.from("estoque").insert({ produto_id: produtoId, unidade: product.unidade, quantidade_atual: product.quantidade_atual, estoque_minimo: product.estoque_minimo }).select("id");
         if (estoqueResult.error) { setToast("Não foi possível salvar o estoque."); return; }
+        if (!estoqueResult.data?.length) { setToast(`Você não tem permissão para cadastrar estoque na unidade ${product.unidade}.`); return; }
       } else {
-        const produtoResult = await supabase.from("produtos").update(produtoPayload).eq("id", product.produto_id);
-        if (produtoResult.error) { setToast("Não foi possível salvar o produto."); return; }
-        const estoqueResult = await supabase.from("estoque").update({ quantidade_atual: product.quantidade_atual, estoque_minimo: product.estoque_minimo }).eq("id", product.id);
+        // `.select()` devolve as linhas alteradas: sem ele, um update barrado
+        // pela RLS afeta zero linhas e volta sem erro — o app anunciava sucesso
+        // sem ter salvo nada.
+        const produtoResult = await supabase.from("produtos").update(produtoPayload).eq("id", product.produto_id).select("id");
+        if (produtoResult.error) { setToast(produtoResult.error.code === "23505" ? `A referência ${product.referencia_produto} já pertence a outro produto.` : "Não foi possível salvar o produto."); return; }
+        if (!produtoResult.data.length) { setToast("Você não tem permissão para alterar produtos do catálogo."); return; }
+        const estoqueResult = await supabase.from("estoque").update({ quantidade_atual: product.quantidade_atual, estoque_minimo: product.estoque_minimo }).eq("id", product.id).select("id");
         if (estoqueResult.error) { setToast("Não foi possível salvar o estoque."); return; }
+        if (!estoqueResult.data.length) { setToast(`Você não tem permissão para alterar o estoque da unidade ${product.unidade}.`); return; }
       }
       await loadData();
     } else {
       setProducts((items) => editProduct === "new" ? [product, ...items] : items.map((item) => item.id === product.id ? product : item));
     }
     setEditProduct(null);
-    setToast("Produto salvo com sucesso.");
+    setToast(mensagem);
   }
 
   async function removeProduct(product: Product) {
     if (!window.confirm(`Excluir “${product.nome_produto}” da unidade ${product.unidade}?`)) return;
+    let mensagem = "Produto excluído.";
     if (supabase) {
-      const result = await supabase.from("estoque").delete().eq("id", product.id);
-      if (result.error) { setToast("Este produto possui movimentações."); return; }
+      const result = await supabase.from("estoque").delete().eq("id", product.id).select("id");
+      if (result.error) { setToast("Não foi possível excluir o estoque."); return; }
+      if (!result.data.length) { setToast(`Você não tem permissão para excluir o estoque da unidade ${product.unidade}.`); return; }
+      // Sem estoque em nenhuma unidade o produto sai das telas, mas continuaria
+      // ocupando a referência única do catálogo. Tiramos o cadastro também —
+      // exceto quando há movimentações, que precisam dele para o histórico
+      // (a FK de movimentacoes é `on delete restrict`).
+      const restante = await supabase.from("estoque").select("id").eq("produto_id", product.produto_id).limit(1);
+      if (!restante.error && !restante.data.length) {
+        const removido = await supabase.from("produtos").delete().eq("id", product.produto_id);
+        if (removido.error) mensagem = "Estoque removido. O produto segue no catálogo porque tem movimentações no histórico.";
+      }
+      await loadData();
+    } else {
+      setProducts((items) => items.filter((item) => item.id !== product.id));
     }
-    setProducts((items) => items.filter((item) => item.id !== product.id));
-    setToast("Produto excluído.");
+    setToast(mensagem);
   }
 
   async function register(product: Product, quantity: number, type: MovementType, note: string) {
@@ -886,7 +921,7 @@ function ProductModal({ product, defaultUnidade, onClose, onSave }: { product: P
           <label className="field"><b>Estoque mínimo</b><input type="number" min={0} value={form.estoque_minimo} onChange={(e) => setForm({ ...form, estoque_minimo: Number(e.target.value) })} /></label>
         </div>
         <label className="field"><b>Quantidade atual</b><input type="number" min={0} value={form.quantidade_atual} onChange={(e) => setForm({ ...form, quantidade_atual: Number(e.target.value) })} /></label>
-        {!product && <small className="unit-hint">Se a referência já existir em outra unidade, o cadastro (nome/descrição) é reaproveitado — só a quantidade desta unidade é criada.</small>}
+        {!product && <small className="unit-hint">A referência identifica o produto no catálogo inteiro. Se ela já existir em outra unidade, o cadastro é reaproveitado e só a quantidade desta unidade é criada; se já existir nesta unidade, o cadastro é recusado.</small>}
         <div className="modal-actions"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary"><Check size={21} />Salvar produto</button></div>
       </form>
     </Modal>
